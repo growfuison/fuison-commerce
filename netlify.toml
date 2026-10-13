@@ -1,0 +1,7 @@
+[build]
+  command = "node scripts/build-netlify.mjs"
+  publish = "out/netlify"
+
+[build.environment]
+  NODE_VERSION = "24"
+  NETLIFY_NEXT_PLUGIN_SKIP = "true"
