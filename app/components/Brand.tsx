@@ -1,0 +1,2 @@
+import Link from 'next/link';
+export default function Brand({priority=true}:{priority?:boolean}){return <Link prefetch={false} className="brand" href="/" aria-label="Fuison Commerce home"><span className="brand-mark"><img src="/assets/fuison-mark.4ebae42ef5.webp" width={202} height={176} decoding="async" loading={priority?'eager':'lazy'} alt=""/></span><span className="brand-type">Fuison<span>Commerce</span></span></Link>}

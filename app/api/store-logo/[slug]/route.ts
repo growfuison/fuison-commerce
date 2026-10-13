@@ -1,0 +1,4 @@
+import {validSlug} from '../../../../lib/merchant-validation';
+import {database,bucket} from '../../../../lib/merchant-server';
+export const dynamic='force-dynamic';
+export async function GET(_request:Request,{params}:{params:Promise<{slug:string}>}){try{const {slug}=await params;if(!validSlug(slug))return new Response(null,{status:404});const store=await database().prepare('SELECT logo_key FROM merchant_stores WHERE slug=?').bind(slug).first<{logo_key:string}>();if(!store)return new Response(null,{status:404});const image=await bucket().get(store.logo_key);if(!image)return new Response(null,{status:404});return new Response(image.body,{headers:{'Content-Type':image.httpMetadata?.contentType||'application/octet-stream','Cache-Control':'private, max-age=300','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'"}})}catch{return new Response(null,{status:503})}}

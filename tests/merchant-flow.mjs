@@ -1,0 +1,43 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import ts from 'typescript';
+import {DatabaseSync} from 'node:sqlite';
+const dir='work/merchant-tests';fs.mkdirSync(dir,{recursive:true});
+const paths={validation:'lib/merchant-validation.ts',server:'lib/merchant-server.ts',status:'app/api/merchant/status/route.ts',send:'app/api/merchant/code/send/route.ts',verify:'app/api/merchant/code/verify/route.ts',slug:'app/api/merchant/slug/route.ts',logo:'app/api/merchant/logo/route.ts',create:'app/api/merchant/store/route.ts',login:'app/api/merchant/login/route.ts',readLogo:'app/api/store-logo/[slug]/route.ts'};
+fs.writeFileSync(`${dir}/mock.mjs`,'export const env={};export let user=null;export function setUser(v){user=v}export async function getChatGPTUser(){return user}');
+for(const [name,file] of Object.entries(paths)){
+ let code=ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
+ code=code.replace(/from ['"]cloudflare:workers['"]/g,"from './mock.mjs'").replace(/from ['"][^'"]*chatgpt-auth['"]/g,"from './mock.mjs'").replace(/from ['"][^'"]*merchant-validation['"]/g,"from './validation.mjs'").replace(/from ['"][^'"]*merchant-server['"]/g,"from './server.mjs'");
+ fs.writeFileSync(`${dir}/${name}.mjs`,code);
+}
+const {env,setUser}=await import(`../${dir}/mock.mjs`);const routes={};for(const name of Object.keys(paths))routes[name]=await import(`../${dir}/${name}.mjs`);
+let sqlite,mail,delivery=true;const objects=new Map();
+function statement(sql,values=[]){return {bind(...v){return statement(sql,v)},async first(){return sqlite.prepare(sql).get(...values)||null},async run(){const r=sqlite.prepare(sql).run(...values);return {meta:{changes:Number(r.changes)}}}}}
+function reset(){sqlite?.close();sqlite=new DatabaseSync(':memory:');sqlite.exec(fs.readFileSync('drizzle/0000_vengeful_sersi.sql','utf8'));env.DB={prepare:sql=>statement(sql),async batch(items){sqlite.exec('BEGIN');try{const result=[];for(const item of items)result.push(await item.run());sqlite.exec('COMMIT');return result}catch(e){sqlite.exec('ROLLBACK');throw e}}};env.BUCKET={async put(k,b,meta){objects.set(k,{body:b,...meta})},async head(k){return objects.get(k)||null},async get(k){return objects.get(k)||null}};env.RESEND_API_KEY='dummy-test-only-key';env.VERIFICATION_FROM_EMAIL='Fuison <test@example.com>';setUser({userId:'owner-1',email:'owner@example.com'});mail=null;delivery=true;objects.clear()}
+globalThis.fetch=async (_url,opts)=>{mail=JSON.parse(opts.body);return new Response('{}',{status:delivery?200:502})};
+function jsonRequest(body,origin='https://test.example'){return new Request('https://test.example/api',{method:'POST',headers:{origin,'Content-Type':'application/json'},body:JSON.stringify(body)})}
+async function post(name,body,status=200,origin){const r=await routes[name].POST(jsonRequest(body,origin));assert.equal(r.status,status,`${name} HTTP status`);return r.json()}
+async function send(purpose='create'){const d=await post('send',{email:'owner@example.com',purpose});assert(!('code' in d),'OTP is never returned to client');assert.match(mail.text,/\b\d{5}\b/);return {...d,code:mail.text.match(/\b\d{5}\b/)[0]}}
+async function proof(purpose='create'){const c=await send(purpose);return post('verify',{challengeId:c.challengeId,code:c.code})}
+const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jfS8AAAAASUVORK5CYII=','base64');
+async function upload(v,file=new File([png],'logo.png',{type:'image/png'}),status=200){const f=new FormData();f.set('challengeId',v.challengeId);f.set('proof',v.proof);f.set('logo',file);const r=await routes.logo.POST(new Request('https://test.example/api',{method:'POST',headers:{origin:'https://test.example'},body:f}));assert.equal(r.status,status);return r.json()}
+const business=(v,key,slug='my-store')=>({...v,ownerName:'Junayed Abedin',businessName:'My Store',slug,logoKey:key});
+reset();
+assert(routes.validation.validSlug('niva-studio'));for(const s of ['ab','admin','a--b','-bad','bad-','বাংলা','Bad','a'.repeat(41)])assert(!routes.validation.validSlug(s));assert.equal(routes.validation.makeSlug('Niva Studio!'),'niva-studio');assert.equal(routes.validation.normalizeEmail(' Owner@Example.com '),'owner@example.com');assert.equal(routes.validation.normalizeEmail('a\n@b.com'),null);
+for(let i=0;i<100;i++)assert.match(routes.validation.fiveDigitCode(),/^\d{5}$/);
+assert.equal(routes.validation.logoType(new TextEncoder().encode('<svg/>')),null);
+const offKey=env.RESEND_API_KEY;delete env.RESEND_API_KEY;assert.equal((await routes.status.GET().then(r=>r.json())).emailReady,false);await post('send',{email:'owner@example.com'},503);assert.equal(mail,null);env.RESEND_API_KEY=offKey;
+setUser(null);await post('send',{email:'owner@example.com'},401);setUser({userId:'owner-1',email:'owner@example.com'});await post('send',{email:'owner@example.com'},403,'https://evil.example');await post('send',{email:'someone@example.com'},400);
+let challenge=await send();assert.notEqual(sqlite.prepare('SELECT code_hash FROM email_challenges').get().code_hash,challenge.code);await post('send',{email:'owner@example.com'},429);const wrong=String((Number(challenge.code)+1)%100000).padStart(5,'0');await post('verify',{challengeId:challenge.challengeId,code:wrong},400);let v=await post('verify',{challengeId:challenge.challengeId,code:challenge.code});await post('verify',{challengeId:challenge.challengeId,code:challenge.code},400);
+setUser({userId:'owner-2',email:'owner@example.com'});await upload(v,undefined,403);setUser({userId:'owner-1',email:'owner@example.com'});await upload(v,new File(['<svg/>'],'logo.svg',{type:'image/svg+xml'}),400);await upload(v,new File([new Uint8Array(2*1024*1024+1)],'big.png',{type:'image/png'}),400);
+const image=await upload(v);await post('create',business({...v,proof:'a'.repeat(64)},image.logoKey),403);await post('create',business(v,image.logoKey,'admin'),400);const store=await post('create',business(v,image.logoKey),201);assert.equal(store.url,'/s/my-store');assert.equal(sqlite.prepare('SELECT count(*) AS n FROM merchant_stores').get().n,1);assert.equal(sqlite.prepare('SELECT owner_name FROM merchant_stores').get().owner_name,'Junayed Abedin');await post('create',business(v,image.logoKey),403);await post('send',{email:'owner@example.com'},409);const visible=await routes.readLogo.GET(new Request('https://test.example'),{params:Promise.resolve({slug:'my-store'})});assert.equal(visible.status,200);assert.equal(visible.headers.get('content-type'),'image/png');
+sqlite.prepare('UPDATE email_challenges SET created_at=created_at-120000').run();v=await proof('login');await post('login',v);await post('login',v,403);
+// A different identity cannot reserve an existing store URL; the transaction is rolled back.
+setUser({userId:'owner-2',email:'owner@example.com'});v=await proof();const image2=await upload(v);await post('create',business(v,image2.logoKey),409);assert.equal(sqlite.prepare('SELECT count(*) AS n FROM merchant_stores').get().n,1);assert.equal(sqlite.prepare('SELECT consumed_at FROM email_challenges WHERE id=?').get(v.challengeId).consumed_at,null);
+reset();challenge=await send();for(let i=0;i<5;i++)await post('verify',{challengeId:challenge.challengeId,code:String((Number(challenge.code)+1)%100000).padStart(5,'0')},400);await post('verify',{challengeId:challenge.challengeId,code:challenge.code},400);
+reset();challenge=await send();sqlite.prepare('UPDATE email_challenges SET expires_at=?').run(Date.now()-1);await post('verify',{challengeId:challenge.challengeId,code:challenge.code},400);
+reset();v=await proof();sqlite.prepare('UPDATE email_challenges SET created_at=created_at-120000').run();await send();await upload(v,undefined,403);
+reset();delivery=false;await post('send',{email:'owner@example.com'},502);assert.equal(sqlite.prepare('SELECT status FROM email_challenges').get().status,'failed');
+reset();v=await proof();sqlite.prepare('UPDATE email_challenges SET proof_expires_at=?').run(Date.now()-1);await upload(v,undefined,403);
+reset();for(let i=0;i<5;i++){await send();sqlite.prepare('UPDATE email_challenges SET created_at=created_at-61000').run()}await post('send',{email:'owner@example.com'},429);
+sqlite.close();console.log('Merchant integration checks passed: native identity isolation, CSRF, missing delivery configuration, five-digit OTP hashing, cooldown/rate limit, attempt/expiry/replay protection, logo validation, persistent store creation, duplicate URL rollback, login and logo retrieval. No real emails were sent.');
